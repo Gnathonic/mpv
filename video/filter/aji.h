@@ -50,10 +50,10 @@ enum aji_format {
                               full-resolution chroma. Valid for input and
                               output; TensorRT backend only. */
     AJI_FMT_RGB10A2 = 4,   /* packed 10-bit RGB (DXGI R10G10B10A2 / mpv
-                              x2bgr10: R in the low 10 bits). DirectML only —
-                              what mpv hwuploads a 4:4:4 source to on D3D11.
-                              Already RGB, so the backend skips the YUV
-                              matrix and round-trips it as RGB. */
+                              x2bgr10: R in the low 10 bits). DirectML input
+                              only — what mpv hwuploads a 4:4:4 source to on
+                              D3D11. Already RGB, so the backend skips the
+                              YUV->RGB matrix; output is 4:2:0. */
 };
 
 enum aji_matrix {
@@ -148,7 +148,12 @@ AJI_EXPORT int aji_configure(aji_ctx *c, int w, int h, double fps,
  * ticket taken after this call completes (see aji_flush). Successive
  * calls are ordered on the same stream/queue, so queuing the next frame
  * before the previous one completes is safe. Frame dims must match the
- * last aji_configure(). */
+ * last aji_configure().
+ *
+ * The output format is independent of the input: any 4:2:0 input (NV12 or
+ * P010) may be written as NV12, P010 (e.g. an 8-bit source to a 10-bit file,
+ * or the reverse) or YUV444P16 (TensorRT only); the backend matrixes and
+ * quantizes to the output format. */
 AJI_EXPORT int aji_infer(aji_ctx *c, const aji_frame *in,
                          const aji_frame *out, void *cu_stream);
 
@@ -166,6 +171,24 @@ AJI_EXPORT int aji_done(aji_ctx *c, uint64_t ticket);
  * loss/timeout. */
 AJI_EXPORT int aji_wait(aji_ctx *c, uint64_t ticket);
 
+/* Max frames the caller may keep in flight (submitted via aji_infer but not yet
+ * aji_wait'd) before aji_infer back-pressures/blocks — i.e. the backend's engine
+ * ring size. The pipelined filter MUST clamp its queue depth to this: submitting
+ * more than the ring holds before collecting deadlocks (the submit fills the ring
+ * and aji_infer blocks for a free slot before the caller ever waits one). Values:
+ * ncnn-Vulkan 12, TensorRT 8, ROCm/MIGraphX 4. A value <= 0 (or a missing symbol
+ * on an older backend) means "unknown — use a conservative default". */
+AJI_EXPORT int aji_max_in_flight(aji_ctx *c);
+
+/* Which backend library the dispatcher (aji.dll / libaji.so) would load for this
+ * animejanai.conf: "trt", "dml", "rocm" or "vk". NULL conf_path = direct mode =
+ * "trt". Does not load anything. OPTIONAL symbol — the player resolves it with
+ * dlsym/GetProcAddress and must tolerate its absence (older engines); the API
+ * version is unchanged. The mpv filter uses it to take its CUDA software-ingest
+ * path only when the CUDA/TensorRT backend is actually selected, instead of
+ * whenever libcuda happens to be loadable. */
+AJI_EXPORT const char *aji_backend_probe(const char *conf_path);
+
 /* Human-readable description of the active configuration, formatted like
  * currentanimejanai.log (info lines, blank line, numbered steps). Valid
  * after aji_configure() until the next configure/destroy. */
@@ -177,6 +200,17 @@ AJI_EXPORT int aji_scale_factor(aji_ctx *c);
 /* RIFE interpolation factor of the active chain. Returns 1 and fills
  * num/den if RIFE is active after the last aji_configure(), else 0. */
 AJI_EXPORT int aji_rife_factor(aji_ctx *c, int *num, int *den);
+
+/* RIFE ordering of the active chain. Returns 1 if RIFE is active AND runs
+ * before the upscale models (interpolating source-resolution frames, which
+ * the upscale models then process), else 0 (RIFE inactive, or the default
+ * order where it interpolates the already-upscaled frames). When this returns
+ * 1, aji_infer_rife() takes source-resolution frame pairs and the caller
+ * upscales each interpolated frame with aji_infer(); when 0, the caller
+ * upscales first and aji_infer_rife() takes the upscaled pairs. Added without
+ * an API_VERSION bump: purely additive, callers built against an older header
+ * simply never query it and get the default order. */
+AJI_EXPORT int aji_rife_before_upscale(aji_ctx *c);
 
 /* Pre-RIFE downscale (rife-first only). When aji_rife_before_upscale() returns
  * 1 and the active chain's first model carries a "resize before upscale", this
@@ -202,8 +236,12 @@ AJI_EXPORT int aji_resize(aji_ctx *c, const aji_frame *in,
  * per frame. */
 AJI_EXPORT int aji_poll(aji_ctx *c);
 
-/* Interpolate between two already-upscaled frames (dims = configure's
- * output dims) at time point t in (0,1). Returns AJI_OK with *out
+/* Interpolate between two frames at time point t in (0,1). In the default
+ * order the inputs are already-upscaled frames (dims = configure's output
+ * dims); when aji_rife_before_upscale() returns 1 they are source-resolution
+ * frames (dims = configure's input dims) and the caller upscales the result.
+ * Either way the dims must match what the active chain configured. Returns
+ * AJI_OK with *out
  * written, or AJI_SCENE if the pair straddles a scene change (out is
  * untouched; emit a duplicate of `a` instead, like the reference
  * pipeline). The documented synchronous exception to the ticket model:
