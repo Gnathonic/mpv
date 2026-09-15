@@ -803,6 +803,18 @@ static bool configure_aji(struct mp_filter *vf)
                     p->api.rife_before_upscale(p->aji);
     if (p->rife_first)
         MP_VERBOSE(vf, "RIFE-first: interpolating before upscaling\n");
+    if (p->rife_first && p->sw_ingest) {
+        // sw_ingest stages the decoded host frame on CUDA only inside
+        // submit_frame(); the RIFE-first path builds its sources
+        // (interp_source/downscale_src) straight from the host frame and would
+        // hand host pointers to the CUDA stream. Not wired yet - fail cleanly,
+        // like the RIFE-only passthrough guard in render().
+        MP_ERR(vf, "RIFE-first with a software-decoded source is not supported "
+                   "on the CUDA path; use hwdec=nvdec or a RIFE-after-upscale "
+                   "chain\n");
+        mp_filter_internal_mark_failed(vf);
+        return false;
+    }
     // Pre-RIFE downscale: when rife-first, ask the engine whether the first
     // model's "resize before upscale" was hoisted ahead of RIFE. If so, source
     // frames are downscaled to (work_w, work_h) via api.resize before being
