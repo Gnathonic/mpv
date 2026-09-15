@@ -1,12 +1,20 @@
 /*
- * vf_animejanai: GPU-resident AI upscaling filter (CUDA / D3D11)
+ * vf_animejanai: AI upscaling filter (CUDA / D3D11 / software)
  *
- * The filter keeps frames in GPU memory end to end: IMGFMT_CUDA or
- * IMGFMT_D3D11 in, own AVHWFramesContext output pool, same format out.
+ * The CUDA and D3D11 paths keep frames in GPU memory end to end: IMGFMT_CUDA
+ * or IMGFMT_D3D11 in, own AVHWFramesContext output pool, same format out.
+ * The software path (IMGFMT_NV12 / IMGFMT_P010 in, sw pool out) carries any
+ * software-decoded source on a build without CUDA (Linux/AMD/Intel): it hands
+ * host YUV planes to the shim, whose ncnn-Vulkan or ROCm backend does the
+ * parity-matched color and the model on the GPU internally. On a CUDA build a
+ * software-decoded source is instead uploaded to CUDA at ingest and run
+ * through the TensorRT path (sw_ingest) when that is the configured backend.
+ * The refqueue's own autoconvert delivers the input in whichever accepted
+ * format is closest, so hwdec frames stay on their GPU path.
  * Inference runs in the libaji shim, loaded at runtime across a strict
  * C ABI (see aji.h) so no inference toolchain links into mpv; the shim
  * dispatches on the conf's backend key (TensorRT on CUDA frames,
- * DirectML on D3D11 frames).
+ * DirectML on D3D11 frames, ncnn-Vulkan / ROCm on host frames).
  *
  * On the D3D11 path, decoder textures are neither shareable nor
  * implicitly synchronized (see vf_amf.c), so each input frame is staged
@@ -20,7 +28,8 @@
  *  - engine=file.engine: single fixed engine (spike/debug).
  *  - neither: synchronized GPU-side plane copy (passthrough).
  *
- * Upscale chains run pipelined (queue-depth frames in flight, default 3):
+ * Upscale chains run pipelined (queue-depth frames in flight; default auto =
+ * 3 on the GPU-resident paths, 6 on the software path):
  * aji_infer only submits, completion is gated per frame through the
  * shim's ticket API (aji_flush/aji_wait), and the refqueue's future-ref
  * window provides the input read-ahead. RIFE chains stay synchronous
@@ -54,10 +63,12 @@
 #include <dlfcn.h>
 #endif
 
+#if HAVE_CUDA_HWACCEL
 #include <ffnvcodec/dynlink_loader.h>
+#include <libavutil/hwcontext_cuda.h>
+#endif
 
 #include <libavutil/hwcontext.h>
-#include <libavutil/hwcontext_cuda.h>
 #include <libavutil/pixfmt.h>
 
 #if HAVE_D3D11
@@ -72,6 +83,8 @@
 #include "options/path.h"
 #include "refqueue.h"
 #include "video/fmt-conversion.h"
+#include "video/hwdec.h"
+#include "video/img_format.h"
 #include "video/mp_image.h"
 #include "video/mp_image_pool.h"
 
@@ -150,7 +163,30 @@ struct opts {
     int queue_depth;
 };
 
-#define MAX_DEPTH 4
+// In-flight pipeline cap. 8 keeps multi-worker engines (ncnn-Vulkan, engine
+// ring 12) fed; update_depth clamps the active depth to what the backend
+// reports via aji_max_in_flight (TensorRT 8, ROCm/MIGraphX 4).
+#define MAX_DEPTH 8
+
+// Wave size for the software path's RIFE-before-upscale upscales: how many
+// grid frames are submitted to the ring before the oldest is popped, so
+// consecutive upscales overlap (one frame's CPU out-color / download runs
+// while the next frame's model eval is in flight). The shim's submit
+// (aji_infer) blocks once its in-flight ring is full and a slot is only freed
+// by aji_wait (the pop), so the wave must never exceed the engine ring
+// (update_depth clamps it via aji_max_in_flight). A pair with more grid
+// frames than this (e.g. 5x) runs in successive waves. The hardware paths
+// keep the synchronous submit+pop per grid point (wave 1).
+#define RIFE_WAVE 4
+
+// queue-depth=0 (the default) means "auto": upstream's 3 on the GPU-resident CUDA/D3D11
+// paths, 6 on the host-plane software path, whose per-frame CPU colour + host<->GPU
+// copies need the deeper pipeline to overlap (measured on ncnn-Vulkan/ROCm). Explicit
+// values apply everywhere (still clamped to the backend ring by update_depth).
+#define AUTO_DEPTH_HW 3
+#define AUTO_DEPTH_SW 6
+struct priv;
+static int requested_depth(const struct priv *p);
 
 struct aji_api {
     void *handle;
@@ -163,8 +199,10 @@ struct aji_api {
     uint64_t (*flush)(aji_ctx *c, void *cu_stream);
     int (*done)(aji_ctx *c, uint64_t ticket);
     int (*wait)(aji_ctx *c, uint64_t ticket);
+    int (*max_in_flight)(aji_ctx *c);   // optional: engine ring size
     int (*rife_factor)(aji_ctx *c, int *num, int *den);
     int (*rife_before_upscale)(aji_ctx *c);  // optional (may be NULL)
+    const char *(*backend_probe)(const char *conf_path);  // optional
     int (*pre_resize)(aji_ctx *c, int *work_w, int *work_h);  // optional
     int (*resize)(aji_ctx *c, const aji_frame *in, const aji_frame *out,
                   void *cu_stream);          // optional; pre-RIFE downscale
@@ -186,17 +224,29 @@ struct priv {
              *lib, *rife_model_dir;
     } path;
 
+#if HAVE_CUDA_HWACCEL
     CudaFunctions *cu;
-    AVBufferRef *av_device_ref;
     CUcontext cuda_ctx;
-    CUstream stream;
     CUstream own_stream;
     CUstream decode_stream;          // stream NVDEC decode/copy runs on (may be NULL/default)
     CUevent  decode_evt[MAX_DEPTH];  // per-frame decode->inference ordering events
     int      decode_evt_next;
     bool     decode_evt_ok;
+#endif
+    AVBufferRef *av_device_ref;
+    void *stream;        // CUstream on the CUDA path; NULL for D3D11 / software
 
     bool is_d3d11;
+    bool is_sw;          // software input: drive the shim with host YUV planes
+    bool sw_ingest;      // software source uploaded to CUDA at ingest, then run
+                         // through the normal cuda-in/cuda-out pipeline (the
+                         // TensorRT path for codecs NVDEC can't decode).
+                         // Mutually exclusive with is_sw: when this is set the
+                         // frame is treated as a hardware CUDA frame downstream.
+    // Software-path pools (host memory): upscaled outputs, source-res and
+    // work-res frames for RIFE-before-upscale. Three pools because
+    // mp_image_pool_get resets a pool whenever the requested geometry changes.
+    struct mp_image_pool *sw_pool, *sw_src_pool, *sw_work_pool;
 #if HAVE_D3D11
     ID3D11Device *d3d_dev;          // borrowed; av_device_ref keeps it alive
     ID3D11DeviceContext *d3d_ctx;
@@ -213,6 +263,7 @@ struct priv {
 #endif
 
     AVBufferRef *hw_pool;
+    AVBufferRef *ingest_pool;   // CUDA pool for sw->GPU ingest uploads
 
     struct aji_api api;
     aji_ctx *aji;
@@ -237,11 +288,17 @@ struct priv {
     // else the queue-depth option.
     struct {
         struct mp_image *src;
+        // For software-ingest sources: the owned CUDA upload of src (NULL for
+        // hw frames and for the host-planes path). Kept alive across the
+        // async window, freed on the same schedule as .out; src stays the
+        // borrowed refqueue identity pointer.
+        struct mp_image *ingest;
         struct mp_image *out;
         uint64_t ticket;
     } ring[MAX_DEPTH];
     int ring_n;
     int depth;
+    int rife_wave;       // RIFE-first upscale wave size (1 = synchronous)
 
     // RIFE: outputs live on a uniform grid of num/den times the input
     // rate (vsmlrt video_player semantics: output j sits at input
@@ -277,6 +334,7 @@ struct priv {
                                      // when has_pre_resize
 };
 
+#if HAVE_CUDA_HWACCEL
 static int check_cu(struct mp_filter *vf, CUresult err, const char *func)
 {
     struct priv *p = vf->priv;
@@ -313,6 +371,14 @@ static bool order_after_decode(struct mp_filter *vf)
     p->cu->cuCtxPopCurrent(&dummy);
     return ok;
 }
+#else
+// No CUDA in this build: the software path passes host planes, which the
+// shim reads synchronously - nothing to order.
+static bool order_after_decode(struct mp_filter *vf)
+{
+    return true;
+}
+#endif
 
 static void aji_log_bridge(void *opaque, int level, const char *msg)
 {
@@ -368,8 +434,10 @@ static void clear_ring(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
     drain_ring(vf);
-    for (int i = 0; i < p->ring_n; i++)
+    for (int i = 0; i < p->ring_n; i++) {
         mp_image_unrefp(&p->ring[i].out);
+        mp_image_unrefp(&p->ring[i].ingest);
+    }
     p->ring_n = 0;
 }
 
@@ -411,8 +479,109 @@ static void flush_frames(struct mp_filter *vf)
 #if HAVE_D3D11
     p->d3d_stage_next = 0;
 #endif
+#if HAVE_CUDA_HWACCEL
     p->decode_evt_next = 0;
+#endif
 }
+
+// Release the CUDA stream/events created against the adopted CUcontext (a
+// no-op on a build without CUDA). The device ref itself is the caller's.
+static void release_cuda_state(struct mp_filter *vf)
+{
+    struct priv *p = vf->priv;
+#if HAVE_CUDA_HWACCEL
+    if (p->cu && p->cuda_ctx) {
+        CUcontext dummy;
+        CUresult err = p->cu->cuCtxPushCurrent(p->cuda_ctx);
+        if (err == CUDA_SUCCESS) {
+            if (p->own_stream)
+                p->cu->cuStreamSynchronize(p->own_stream);
+            for (int i = 0; i < MAX_DEPTH; i++) {
+                if (p->decode_evt[i])
+                    p->cu->cuEventDestroy(p->decode_evt[i]);
+            }
+            if (p->own_stream)
+                p->cu->cuStreamDestroy(p->own_stream);
+            p->cu->cuCtxPopCurrent(&dummy);
+        } else if (p->own_stream || p->decode_evt_ok) {
+            MP_WARN(vf, "Could not make the old CUDA context current while "
+                        "releasing AnimeJaNai device state\n");
+        }
+    }
+
+    for (int i = 0; i < MAX_DEPTH; i++)
+        p->decode_evt[i] = NULL;
+
+    av_buffer_unref(&p->ingest_pool);
+    p->cuda_ctx = NULL;
+    p->own_stream = NULL;
+    p->decode_stream = NULL;
+    p->decode_evt_next = 0;
+    p->decode_evt_ok = false;
+#endif
+    p->stream = NULL;
+}
+
+#if HAVE_CUDA_HWACCEL
+// Adopt a CUDA device context: take its CUcontext and stream, and when the
+// device exposes only the default stream, create a private non-blocking
+// stream (so TensorRT can capture CUDA graphs), ordered after decode through
+// the events order_after_decode records. Shared by the hardware-frame
+// adoption and the software-ingest upload path; the caller sets
+// p->av_device_ref first.
+static void adopt_cuda_device(struct mp_filter *vf, AVCUDADeviceContext *cudactx)
+{
+    struct priv *p = vf->priv;
+    p->is_d3d11 = false;
+    p->cuda_ctx = cudactx->cuda_ctx;
+    p->stream = cudactx->stream;
+    p->decode_stream = cudactx->stream;   // the real decode stream (may be NULL)
+    if (!p->stream) {
+        // ffmpeg's CUDA device context usually leaves this NULL (the
+        // default stream); TensorRT then adds extra stream syncs per
+        // enqueue, and CUDA graph capture is impossible. Use our own.
+        // (Format re-adoptions reuse it; the device ctx is stable.)
+        if (!p->own_stream &&
+            CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
+            CUcontext dummy;
+            if (CHECK_CU(p->cu->cuStreamCreate(&p->own_stream,
+                                    CU_STREAM_NON_BLOCKING)) >= 0) {
+                // A non-blocking stream does not order against the
+                // default stream where decode/copy runs; the events
+                // give that ordering explicitly (order_after_decode).
+                bool evt_ok = true;
+                for (int i = 0; i < MAX_DEPTH; i++)
+                    evt_ok &= CHECK_CU(p->cu->cuEventCreate(
+                        &p->decode_evt[i],
+                        CU_EVENT_DISABLE_TIMING)) >= 0;
+                if (evt_ok) {
+                    p->decode_evt_ok = true;
+                } else {
+                    // Without the events the private stream cannot be
+                    // ordered after decode. Don't keep it and silently
+                    // race: drop it and run inference on the decode/
+                    // default stream (implicitly ordered, at the cost
+                    // of per-enqueue TRT syncs and no CUDA graphs).
+                    MP_WARN(vf, "CUDA event setup failed; falling back "
+                            "to the decode stream (no CUDA graphs)\n");
+                    for (int i = 0; i < MAX_DEPTH; i++) {
+                        if (p->decode_evt[i])
+                            p->cu->cuEventDestroy(p->decode_evt[i]);
+                        p->decode_evt[i] = NULL;
+                    }
+                    p->cu->cuStreamDestroy(p->own_stream);
+                    p->own_stream = NULL;
+                }
+            }
+            CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
+        }
+        // own_stream is NULL if creation/event setup failed; then
+        // p->stream stays the decode (default) stream and inference
+        // is ordered implicitly, never racing.
+        p->stream = p->own_stream;
+    }
+}
+#endif
 
 // Tear down everything whose lifetime is tied to the currently adopted hardware
 // device/frames context, leaving the filter in a clean state that the reinit
@@ -457,40 +626,17 @@ static void release_device_state(struct mp_filter *vf)
     p->d3d_ctx = NULL;
 #endif
 
-    if (p->cu && p->cuda_ctx) {
-        CUcontext dummy;
-        CUresult err = p->cu->cuCtxPushCurrent(p->cuda_ctx);
-        if (err == CUDA_SUCCESS) {
-            if (p->own_stream)
-                p->cu->cuStreamSynchronize(p->own_stream);
-            for (int i = 0; i < MAX_DEPTH; i++) {
-                if (p->decode_evt[i])
-                    p->cu->cuEventDestroy(p->decode_evt[i]);
-            }
-            if (p->own_stream)
-                p->cu->cuStreamDestroy(p->own_stream);
-            p->cu->cuCtxPopCurrent(&dummy);
-        } else if (p->own_stream || p->decode_evt_ok) {
-            MP_WARN(vf, "Could not make the old CUDA context current while "
-                        "releasing AnimeJaNai device state\n");
-        }
-    }
-
-    for (int i = 0; i < MAX_DEPTH; i++)
-        p->decode_evt[i] = NULL;
+    release_cuda_state(vf);
 
     av_buffer_unref(&p->hw_pool);
     av_buffer_unref(&p->src_pool);
     av_buffer_unref(&p->work_pool);
     av_buffer_unref(&p->av_device_ref);
 
-    p->cuda_ctx = NULL;
     p->stream = NULL;
-    p->own_stream = NULL;
-    p->decode_stream = NULL;
-    p->decode_evt_next = 0;
-    p->decode_evt_ok = false;
     p->is_d3d11 = false;
+    p->is_sw = false;
+    p->sw_ingest = false;
     p->aji_active = false;
     p->configured = false;
     p->rife_on = false;
@@ -516,11 +662,34 @@ static void write_stats(struct mp_filter *vf)
 // as do bypass and passthrough; active upscale chains run queue-depth
 // frames deep, with the refqueue's future-ref window supplying the
 // read-ahead (depth - 1 buffered future frames).
+static int requested_depth(const struct priv *p)
+{
+    int d = p->opts->queue_depth;
+    if (d <= 0)
+        d = p->is_sw ? AUTO_DEPTH_SW : AUTO_DEPTH_HW;
+    return MPCLAMP(d, 1, MAX_DEPTH);
+}
+
 static void update_depth(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
-    int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
+    int depth = requested_depth(p);
+    int wave = p->is_sw ? RIFE_WAVE : 1;
+    // The backend's engine ring is a HARD cap on in-flight frames: the
+    // pipelined submit loop fills the ring before it collects any, so a
+    // depth larger than the ring deadlocks (aji_infer blocks for a free slot
+    // mid-submit, before the caller waits one). Clamp to what the backend
+    // reports (ncnn-Vulkan 12, TensorRT 8, ROCm/MIGraphX 4); older shims
+    // don't export aji_max_in_flight and keep the historical behaviour.
+    if (p->aji && p->api.max_in_flight) {
+        int cap = p->api.max_in_flight(p->aji);
+        if (cap > 0) {
+            depth = MPMIN(depth, cap);
+            wave = MPMIN(wave, cap);
+        }
+    }
     p->depth = (p->aji_active && !p->rife_on) ? depth : 1;
+    p->rife_wave = wave;
     mp_refqueue_set_refs(p->queue, 0, p->depth - 1);
 }
 
@@ -593,11 +762,12 @@ static bool configure_aji(struct mp_filter *vf)
 
     p->aji_active = true;
     p->out_fmt = p->aji_fmt;
-    if (p->opts->output_444 && !p->is_d3d11) {
+    if (p->opts->output_444 && !p->is_d3d11 && !p->is_sw) {
         // Option forces full-resolution 4:4:4 even from a 4:2:0 source
         // (exceeds the reference pipeline, which always subsampled back to
         // 4:2:0). D3D11/DirectML stays 4:2:0 - DXGI has no planar 16-bit
-        // 4:4:4 video format for the pool.
+        // 4:4:4 video format for the pool; the software backends (ncnn-Vulkan
+        // / ROCm) write 4:2:0 only.
         p->out_fmt = AJI_FMT_YUV444P16;
     }
     if (p->out_fmt == AJI_FMT_YUV444P16) {
@@ -633,6 +803,18 @@ static bool configure_aji(struct mp_filter *vf)
                     p->api.rife_before_upscale(p->aji);
     if (p->rife_first)
         MP_VERBOSE(vf, "RIFE-first: interpolating before upscaling\n");
+    if (p->rife_first && p->sw_ingest) {
+        // sw_ingest stages the decoded host frame on CUDA only inside
+        // submit_frame(); the RIFE-first path builds its sources
+        // (interp_source/downscale_src) straight from the host frame and would
+        // hand host pointers to the CUDA stream. Not wired yet - fail cleanly,
+        // like the RIFE-only passthrough guard in render().
+        MP_ERR(vf, "RIFE-first with a software-decoded source is not supported "
+                   "on the CUDA path; use hwdec=nvdec or a RIFE-after-upscale "
+                   "chain\n");
+        mp_filter_internal_mark_failed(vf);
+        return false;
+    }
     // Pre-RIFE downscale: when rife-first, ask the engine whether the first
     // model's "resize before upscale" was hoisted ahead of RIFE. If so, source
     // frames are downscaled to (work_w, work_h) via api.resize before being
@@ -766,9 +948,40 @@ static bool update_d3d11_work_pool(struct mp_filter *vf)
 }
 #endif
 
+// Software path: allocate a host frame of the given aji format/geometry
+// from one of the sw pools.
+static struct mp_image *alloc_sw(struct mp_filter *vf, struct mp_image_pool *pool,
+                                 int aji_fmt, int w, int h, const char *what)
+{
+    int imgfmt = aji_fmt == AJI_FMT_YUV444P16
+                     ? pixfmt2imgfmt(AV_PIX_FMT_YUV444P16)
+                     : aji_fmt == AJI_FMT_P010 ? IMGFMT_P010 : IMGFMT_NV12;
+    struct mp_image *img = mp_image_pool_get(pool, imgfmt, w, h);
+    if (!img)
+        MP_ERR(vf, "Failed to allocate sw %s image\n", what);
+    return img;
+}
+
+// Allocate a CUDA hwframe from `*pool` (created/updated to the geometry).
+static bool update_cuda_pool(struct mp_filter *vf, AVBufferRef **pool,
+                             int hw_subfmt, int w, int h)
+{
+#if HAVE_CUDA_HWACCEL
+    struct priv *p = vf->priv;
+    return mp_update_av_hw_frames_pool(pool, p->av_device_ref, IMGFMT_CUDA,
+                                       hw_subfmt, w, h, false);
+#else
+    return false;
+#endif
+}
+
 static struct mp_image *alloc_out(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
+
+    if (p->is_sw)
+        return alloc_sw(vf, p->sw_pool, p->out_fmt, p->out_params.w,
+                        p->out_params.h, "output");
 
     bool pool_ok;
     if (p->is_d3d11) {
@@ -778,11 +991,8 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
         pool_ok = false;
 #endif
     } else {
-        pool_ok = mp_update_av_hw_frames_pool(&p->hw_pool, p->av_device_ref,
-                                              IMGFMT_CUDA,
-                                              p->out_params.hw_subfmt,
-                                              p->out_params.w,
-                                              p->out_params.h, false);
+        pool_ok = update_cuda_pool(vf, &p->hw_pool, p->out_params.hw_subfmt,
+                                   p->out_params.w, p->out_params.h);
     }
     if (!pool_ok) {
         MP_ERR(vf, "Failed to create hw pool\n");
@@ -807,6 +1017,26 @@ static struct mp_image *alloc_out(struct mp_filter *vf)
     return img;
 }
 
+#if HAVE_CUDA_HWACCEL
+// Upload a software-decoded source frame to a filter-owned CUDA pool. One
+// CPU->GPU copy at the decode boundary; returns an owned CUDA image (the
+// caller frees it once the GPU has finished reading).
+static struct mp_image *sw_ingest_upload(struct mp_filter *vf,
+                                         struct mp_image *in)
+{
+    struct priv *p = vf->priv;
+    if (!update_cuda_pool(vf, &p->ingest_pool, p->params.hw_subfmt,
+                          in->w, in->h)) {
+        MP_ERR(vf, "ingest pool update failed\n");
+        return NULL;
+    }
+    struct mp_image *up = mp_av_pool_image_hw_upload(p->ingest_pool, in);
+    if (!up)
+        MP_ERR(vf, "software-frame CUDA upload failed\n");
+    return up;
+}
+#endif
+
 // Enqueue inference for `in` and append it to the in-flight ring without
 // waiting for the GPU. `in` stays alive (and the decoder surface pinned)
 // through the refqueue until emission waits the entry's ticket.
@@ -816,9 +1046,25 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
 
     mp_assert(p->ring_n < MAX_DEPTH);
 
+    // Software-ingest source: one CPU->GPU upload at ingest, then drive the
+    // engine from the CUDA copy. Hardware frames and the host-planes path
+    // keep use == in (no upload).
+    struct mp_image *ingest = NULL;
+    struct mp_image *use = in;
+#if HAVE_CUDA_HWACCEL
+    if (p->sw_ingest && !p->is_d3d11 && in->imgfmt != IMGFMT_CUDA) {
+        ingest = sw_ingest_upload(vf, in);
+        if (!ingest)
+            return false;
+        use = ingest;
+    }
+#endif
+
     struct mp_image *out = alloc_out(vf);
-    if (!out)
+    if (!out) {
+        mp_image_unrefp(&ingest);
         return false;
+    }
     mp_image_copy_attributes(out, in);
     out->params = p->out_params;
     out->pts = in->pts;
@@ -873,10 +1119,12 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
             // (downscaled) size in rife-first mode.
             .width = in->w, .height = in->h, .format = p->aji_fmt,
             .matrix = mat, .range = rng, .siting = sit,
-            // plane[2]/stride[2] carry Cr for 4:4:4 input; ignored by the
-            // engine for the 2-plane NV12/P010 formats.
-            .plane = {in->planes[0], in->planes[1], in->planes[2]},
-            .stride = {in->stride[0], in->stride[1], in->stride[2]},
+            // `use` is the CUDA upload for a software-ingest source, else the
+            // input frame itself (a CUDA hw frame, or host planes on the
+            // software path). plane[2]/stride[2] carry Cr for 4:4:4 input;
+            // ignored by the engine for the 2-plane NV12/P010 formats.
+            .plane = {use->planes[0], use->planes[1], use->planes[2]},
+            .stride = {use->stride[0], use->stride[1], use->stride[2]},
         };
         const aji_frame fout = {
             .width = p->out_params.w, .height = p->out_params.h,
@@ -887,8 +1135,11 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
         };
         if (!order_after_decode(vf)) {
             talloc_free(out);
+            mp_image_unrefp(&ingest);
             return false;
         }
+        // NULL on the software path: the shim runs the frame on its own
+        // queue and completes it in aji_wait.
         stream = p->stream;
         ok = p->api.infer(p->aji, &fin, &fout, p->stream) == AJI_OK;
     }
@@ -900,10 +1151,12 @@ static bool submit_frame(struct mp_filter *vf, struct mp_image *in)
         // references `out`; let it finish before the frame is freed
         p->api.wait(p->aji, p->api.flush(p->aji, stream));
         talloc_free(out);
+        mp_image_unrefp(&ingest);
         return false;
     }
 
     p->ring[p->ring_n].src = in;
+    p->ring[p->ring_n].ingest = ingest;   // owned; freed in pop_ring/clear_ring
     p->ring[p->ring_n].out = out;
     p->ring[p->ring_n].ticket = ticket;
     p->ring_n++;
@@ -918,11 +1171,14 @@ static struct mp_image *pop_ring(struct mp_filter *vf)
 
     mp_assert(p->ring_n > 0);
     struct mp_image *out = p->ring[0].out;
+    struct mp_image *ingest = p->ring[0].ingest;
     uint64_t ticket = p->ring[0].ticket;
     p->ring_n--;
     memmove(&p->ring[0], &p->ring[1], p->ring_n * sizeof(p->ring[0]));
 
-    if (p->api.wait(p->aji, ticket) != AJI_OK) {
+    int ret = p->api.wait(p->aji, ticket);
+    mp_image_unrefp(&ingest);   // GPU done reading the uploaded source
+    if (ret != AJI_OK) {
         MP_ERR(vf, "inference wait failed: %s\n", p->api.last_error(p->aji));
         talloc_free(out);
         return NULL;
@@ -933,8 +1189,6 @@ static struct mp_image *pop_ring(struct mp_filter *vf)
 static struct mp_image *render(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
-    CUcontext dummy;
-    int ret = -1;
 
     struct mp_image *in = mp_refqueue_get(p->queue, 0);
     if (!in)
@@ -964,6 +1218,12 @@ static struct mp_image *render(struct mp_filter *vf)
     out->params = p->out_params;
     out->pts = in->pts;
 
+    if (p->is_sw) {
+        // Passthrough on the software path is a plain host-memory copy.
+        mp_image_copy(out, in);
+        return out;
+    }
+
 #if HAVE_D3D11
     if (p->is_d3d11) {
         // Passthrough: same-device copy into the output slice (implicitly
@@ -976,6 +1236,24 @@ static struct mp_image *render(struct mp_filter *vf)
         return out;
     }
 #endif
+
+#if HAVE_CUDA_HWACCEL
+    CUcontext dummy;
+    int ret = -1;
+
+    if (p->sw_ingest) {
+        // A software-ingest source reaching this passthrough means RIFE is
+        // active with no upscale chain: the copy below is GPU-to-GPU, so it
+        // would need the host frame staged on CUDA first (and a CUDA output
+        // pool). That combination isn't wired - upscale chains take the
+        // submit_frame path above and are unaffected. Fail cleanly rather
+        // than read host memory as a device pointer.
+        MP_ERR(vf, "RIFE-only passthrough of a software-decoded source is "
+                   "not supported on the CUDA path; add an upscale model\n");
+        TA_FREEP(&out);
+        mp_filter_internal_mark_failed(vf);
+        return NULL;
+    }
 
     if (!order_after_decode(vf))
         goto done;
@@ -1010,6 +1288,12 @@ done:
     if (ret < 0)
         TA_FREEP(&out);
     return out;
+#else
+    // Unreachable: without CUDA, reinit only admits D3D11 or software input.
+    MP_ERR(vf, "no passthrough path for this input\n");
+    TA_FREEP(&out);
+    return NULL;
+#endif
 }
 
 // Interpolate between two upscaled frames at time point t. Returns the
@@ -1021,7 +1305,6 @@ static struct mp_image *render_interp(struct mp_filter *vf,
                                       double t)
 {
     struct priv *p = vf->priv;
-    CUcontext dummy;
 
     struct mp_image *out = alloc_out(vf);
     if (!out)
@@ -1061,11 +1344,16 @@ static struct mp_image *render_interp(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;  // the DirectML shim completes synchronously
+    // The DirectML and software (ncnn-Vulkan / ROCm) shims complete
+    // synchronously.
+    bool ok = p->is_d3d11 || p->is_sw;
+#if HAVE_CUDA_HWACCEL
+    CUcontext dummy;
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
     }
+#endif
     if (!ok)
         TA_FREEP(&out);
     return out;
@@ -1078,6 +1366,10 @@ static struct mp_image *alloc_src(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
 
+    if (p->is_sw)
+        return alloc_sw(vf, p->sw_src_pool, p->aji_fmt, p->params.w,
+                        p->params.h, "source");
+
     bool pool_ok;
     if (p->is_d3d11) {
 #if HAVE_D3D11
@@ -1086,9 +1378,8 @@ static struct mp_image *alloc_src(struct mp_filter *vf)
         pool_ok = false;
 #endif
     } else {
-        pool_ok = mp_update_av_hw_frames_pool(&p->src_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
-                                              p->params.w, p->params.h, false);
+        pool_ok = update_cuda_pool(vf, &p->src_pool, p->params.hw_subfmt,
+                                   p->params.w, p->params.h);
     }
     if (!pool_ok) {
         MP_ERR(vf, "Failed to create source hw pool\n");
@@ -1117,6 +1408,10 @@ static struct mp_image *alloc_work(struct mp_filter *vf)
     if (!p->has_pre_resize)
         return alloc_src(vf);
 
+    if (p->is_sw)
+        return alloc_sw(vf, p->sw_work_pool, p->aji_fmt, p->work_w,
+                        p->work_h, "work");
+
     bool pool_ok;
     if (p->is_d3d11) {
 #if HAVE_D3D11
@@ -1125,9 +1420,8 @@ static struct mp_image *alloc_work(struct mp_filter *vf)
         pool_ok = false;
 #endif
     } else {
-        pool_ok = mp_update_av_hw_frames_pool(&p->work_pool, p->av_device_ref,
-                                              IMGFMT_CUDA, p->params.hw_subfmt,
-                                              p->work_w, p->work_h, false);
+        pool_ok = update_cuda_pool(vf, &p->work_pool, p->params.hw_subfmt,
+                                   p->work_w, p->work_h);
     }
     if (!pool_ok) {
         MP_ERR(vf, "Failed to create work hw pool\n");
@@ -1252,7 +1546,6 @@ static struct mp_image *interp_source(struct mp_filter *vf,
                                       double t)
 {
     struct priv *p = vf->priv;
-    CUcontext dummy;
 
     struct mp_image *out = alloc_work(vf);
     if (!out)
@@ -1289,11 +1582,16 @@ static struct mp_image *interp_source(struct mp_filter *vf,
         talloc_free(out);
         return NULL;
     }
-    bool ok = p->is_d3d11;   // the DirectML shim completes synchronously
+    // The DirectML and software (ncnn-Vulkan / ROCm) shims complete
+    // synchronously.
+    bool ok = p->is_d3d11 || p->is_sw;
+#if HAVE_CUDA_HWACCEL
+    CUcontext dummy;
     if (!ok && CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
         ok = CHECK_CU(p->cu->cuStreamSynchronize(p->stream)) >= 0;
         CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
     }
+#endif
     if (!ok)
         TA_FREEP(&out);
     return out;
@@ -1309,6 +1607,48 @@ static struct mp_image *upscale_image(struct mp_filter *vf,
     return pop_ring(vf);
 }
 
+// RIFE-first: upscale the ordered grid frames in[0..n) into out[0..n) through
+// the ring, `wave` frames in flight at a time (wave 1 = upscale_image per
+// frame, the hardware paths' synchronous order; the software path uses
+// p->rife_wave so consecutive upscales overlap). Inputs are only released by
+// the caller after this returns, so a temp stays alive until its pop.
+// Returns the number of leading entries that upscaled cleanly; on the first
+// failure it stops submitting, drains what is in flight and leaves the rest
+// NULL (a later success without its predecessor would leave a grid gap).
+static int upscale_batch(struct mp_filter *vf, struct mp_image **in,
+                         struct mp_image **out, int n, int wave)
+{
+    struct priv *p = vf->priv;
+    int next = 0;       // next frame to submit
+    int done = 0;       // next frame to pop (== the ring's oldest)
+    int good = 0;       // length of the clean contiguous prefix
+    bool stop = false;
+
+    wave = MPCLAMP(wave, 1, MAX_DEPTH);
+    for (int i = 0; i < n; i++)
+        out[i] = NULL;
+
+    while (done < n) {
+        while (!stop && next < n && p->ring_n < wave) {
+            if (!submit_frame(vf, in[next])) {
+                stop = true;
+                break;
+            }
+            next++;
+        }
+        if (done >= next)
+            break;  // nothing in flight and submitting has stopped
+        out[done] = pop_ring(vf);
+        if (out[done] && good == done)
+            good++;
+        done++;
+    }
+
+    for (int i = good; i < n; i++)
+        mp_image_unrefp(&out[i]);
+    return good;
+}
+
 static void vf_animejanai_process(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
@@ -1321,88 +1661,109 @@ static void vf_animejanai_process(struct mp_filter *vf)
 
         p->params = in_fmt->params;
         p->fps = in_fmt->nominal_fps;
-        if (!p->params.hw_subfmt) {
-            MP_ERR(vf, "Unknown hw_subfmt\n");
-            mp_filter_internal_mark_failed(vf);
-            return;
+
+        // Software input (sw decode / --hwdec=no / a GPU without a CUDA or
+        // D3D11 hwdec) is handled one of two ways:
+        //   * CUDA build with a usable driver and the TensorRT backend
+        //     configured: upload to CUDA at ingest and run the normal
+        //     cuda-in/cuda-out pipeline (sw_ingest) - how TensorRT upscales
+        //     codecs NVDEC can't decode (MPEG-4 ASP, High10 H.264, ...).
+        //   * otherwise: drive the shim with host YUV planes (is_sw); the
+        //     ncnn-Vulkan / ROCm backends do color + model on the GPU.
+        // Hardware input (CUDA / D3D11) stays GPU-resident on its device.
+        p->is_sw = !in_fmt->hwctx;
+        p->sw_ingest = false;
+        bool sw_logged = false;
+        if (p->is_sw) {
+            p->is_d3d11 = false;
+            p->stream = NULL;
         }
 
-        // Adopt the device (and thus CUcontext) the incoming frames live on.
-        if (!in_fmt->hwctx) {
-            MP_ERR(vf, "Input frame has no hw frames context\n");
-            mp_filter_internal_mark_failed(vf);
-            return;
-        }
-        AVHWFramesContext *fctx = (void *)in_fmt->hwctx->data;
-        AVHWDeviceContext *avhwctx = fctx->device_ctx;
-        if (avhwctx->type == AV_HWDEVICE_TYPE_CUDA && p->cu) {
-            p->is_d3d11 = false;
-            p->av_device_ref = av_buffer_ref(fctx->device_ref);
-            MP_HANDLE_OOM(p->av_device_ref);
-            AVCUDADeviceContext *cudactx = avhwctx->hwctx;
-            p->cuda_ctx = cudactx->cuda_ctx;
-            p->stream = cudactx->stream;
-            p->decode_stream = cudactx->stream;   // the real decode stream (may be NULL)
-            if (!p->stream) {
-                // ffmpeg's CUDA device context usually leaves this NULL (the
-                // default stream); TensorRT then adds extra stream syncs per
-                // enqueue, and CUDA graph capture is impossible. Use our own.
-                // (Format re-adoptions reuse it; the device ctx is stable.)
-                if (!p->own_stream &&
-                    CHECK_CU(p->cu->cuCtxPushCurrent(p->cuda_ctx)) >= 0) {
-                    CUcontext dummy;
-                    if (CHECK_CU(p->cu->cuStreamCreate(&p->own_stream,
-                                            CU_STREAM_NON_BLOCKING)) >= 0) {
-                        // A non-blocking stream does not order against the
-                        // default stream where decode/copy runs; the events
-                        // give that ordering explicitly (order_after_decode).
-                        bool evt_ok = true;
-                        for (int i = 0; i < MAX_DEPTH; i++)
-                            evt_ok &= CHECK_CU(p->cu->cuEventCreate(
-                                &p->decode_evt[i],
-                                CU_EVENT_DISABLE_TIMING)) >= 0;
-                        if (evt_ok) {
-                            p->decode_evt_ok = true;
-                        } else {
-                            // Without the events the private stream cannot be
-                            // ordered after decode. Don't keep it and silently
-                            // race: drop it and run inference on the decode/
-                            // default stream (implicitly ordered, at the cost
-                            // of per-enqueue TRT syncs and no CUDA graphs).
-                            MP_WARN(vf, "CUDA event setup failed; falling back "
-                                    "to the decode stream (no CUDA graphs)\n");
-                            for (int i = 0; i < MAX_DEPTH; i++) {
-                                if (p->decode_evt[i])
-                                    p->cu->cuEventDestroy(p->decode_evt[i]);
-                                p->decode_evt[i] = NULL;
-                            }
-                            p->cu->cuStreamDestroy(p->own_stream);
-                            p->own_stream = NULL;
-                        }
-                    }
-                    CHECK_CU(p->cu->cuCtxPopCurrent(&dummy));
+#if HAVE_CUDA_HWACCEL
+        if (p->is_sw && p->cu && p->api.handle) {
+            // Only the TensorRT backend consumes CUDA frames; ask the shim
+            // which backend the conf selects (aji_backend_probe loads
+            // nothing). Without that optional symbol (older shims, or a
+            // backend library loaded directly instead of the dispatcher) a
+            // loadable CUDA driver alone selects the upload, as before.
+            const char *be = p->api.backend_probe
+                ? p->api.backend_probe(p->path.conf) : NULL;
+            bool want_cuda = !p->api.backend_probe || (be && !strcmp(be, "trt"));
+            MP_VERBOSE(vf, "Software source: %s (backend %s)\n",
+                       want_cuda ? "CUDA ingest upload" : "host planes",
+                       be ? be : "not reported");
+            sw_logged = true;
+            if (want_cuda) {
+                // Prefer the VO's shared CUDA interop device (so vo=gpu-next
+                // imports the output zero-copy); fall back to a standalone
+                // CUDA device (vo=null / vo=image / encoding - the VO then
+                // downloads the output).
+                struct mp_hwdec_ctx *hw =
+                    mp_filter_load_hwdec_device(vf, IMGFMT_CUDA,
+                                                AV_HWDEVICE_TYPE_CUDA);
+                AVBufferRef *dev = hw && hw->av_device_ref
+                    ? av_buffer_ref(hw->av_device_ref) : NULL;
+                if (!dev && av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_CUDA,
+                                                   NULL, NULL, 0) < 0) {
+                    MP_WARN(vf, "No CUDA device for software-source upload; "
+                            "cannot upscale %s\n",
+                            mp_imgfmt_to_name(p->params.imgfmt));
+                    mp_filter_internal_mark_failed(vf);
+                    return;
                 }
-                // own_stream is NULL if creation/event setup failed; then
-                // p->stream stays the decode (default) stream and inference
-                // is ordered implicitly, never racing.
-                p->stream = p->own_stream;
+                p->av_device_ref = dev;
+                AVHWDeviceContext *dc = (void *)dev->data;
+                adopt_cuda_device(vf, dc->hwctx);
+                // Rewrite params to the equivalent CUDA frame so all
+                // downstream geometry/format/pool code treats it as a hw
+                // source.
+                p->params.hw_subfmt = p->params.imgfmt;
+                p->params.imgfmt = IMGFMT_CUDA;
+                p->sw_ingest = true;
+                p->is_sw = false;
             }
-#if HAVE_D3D11
-        } else if (avhwctx->type == AV_HWDEVICE_TYPE_D3D11VA) {
-            p->is_d3d11 = true;
-            p->av_device_ref = av_buffer_ref(fctx->device_ref);
-            MP_HANDLE_OOM(p->av_device_ref);
-            AVD3D11VADeviceContext *d3dctx = avhwctx->hwctx;
-            p->d3d_dev = d3dctx->device;
-            p->d3d_ctx = d3dctx->device_context;
-            p->stream = NULL;
+        }
 #endif
-        } else {
-            MP_ERR(vf, "Input frames are neither CUDA nor D3D11 frames%s\n",
-                   avhwctx->type == AV_HWDEVICE_TYPE_CUDA
-                       ? " (CUDA driver unavailable)" : "");
-            mp_filter_internal_mark_failed(vf);
-            return;
+        if (p->is_sw && !sw_logged)
+            MP_VERBOSE(vf, "Software source: host planes (no CUDA)\n");
+
+        if (!p->is_sw && !p->sw_ingest) {
+            if (!p->params.hw_subfmt) {
+                MP_ERR(vf, "Unknown hw_subfmt\n");
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
+            // Adopt the device (and thus CUcontext) the incoming frames live on.
+            AVHWFramesContext *fctx = (void *)in_fmt->hwctx->data;
+            AVHWDeviceContext *avhwctx = fctx->device_ctx;
+            bool adopted = false;
+#if HAVE_CUDA_HWACCEL
+            if (avhwctx->type == AV_HWDEVICE_TYPE_CUDA && p->cu) {
+                p->av_device_ref = av_buffer_ref(fctx->device_ref);
+                MP_HANDLE_OOM(p->av_device_ref);
+                adopt_cuda_device(vf, avhwctx->hwctx);
+                adopted = true;
+            }
+#endif
+#if HAVE_D3D11
+            if (!adopted && avhwctx->type == AV_HWDEVICE_TYPE_D3D11VA) {
+                p->is_d3d11 = true;
+                p->av_device_ref = av_buffer_ref(fctx->device_ref);
+                MP_HANDLE_OOM(p->av_device_ref);
+                AVD3D11VADeviceContext *d3dctx = avhwctx->hwctx;
+                p->d3d_dev = d3dctx->device;
+                p->d3d_ctx = d3dctx->device_context;
+                p->stream = NULL;
+                adopted = true;
+            }
+#endif
+            if (!adopted) {
+                MP_ERR(vf, "Input frames are neither CUDA nor D3D11 frames%s\n",
+                       avhwctx->type == AV_HWDEVICE_TYPE_CUDA
+                           ? " (CUDA driver unavailable)" : "");
+                mp_filter_internal_mark_failed(vf);
+                return;
+            }
         }
 
         if (p->api.handle && !p->aji) {
@@ -1413,7 +1774,9 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 : NULL;
             aji_create_params cp = {
                 .api_version = AJI_API_VERSION,
-                .cuda_context = p->is_d3d11 ? NULL : p->cuda_ctx,
+#if HAVE_CUDA_HWACCEL
+                .cuda_context = (!p->is_d3d11 && !p->is_sw) ? p->cuda_ctx : NULL,
+#endif
 #if HAVE_D3D11
                 .d3d11_device = p->is_d3d11 ? p->d3d_dev : NULL,
 #endif
@@ -1439,7 +1802,8 @@ static void vf_animejanai_process(struct mp_filter *vf)
         }
 
         if (p->aji) {
-            enum AVPixelFormat sw = imgfmt2pixfmt(p->params.hw_subfmt);
+            int subfmt = p->is_sw ? p->params.imgfmt : p->params.hw_subfmt;
+            enum AVPixelFormat sw = imgfmt2pixfmt(subfmt);
             // x2bgr10 (packed 10-bit RGB) is what mpv hwuploads a 4:4:4 source
             // to on D3D11 (no planar 4:4:4 DXGI format); the DirectML backend
             // ingests it as RGB and round-trips it as RGB.
@@ -1447,9 +1811,14 @@ static void vf_animejanai_process(struct mp_filter *vf)
                          sw == AV_PIX_FMT_P010 ? AJI_FMT_P010 :
                          sw == AV_PIX_FMT_YUV444P16 ? AJI_FMT_YUV444P16 :
                          sw == AV_PIX_FMT_X2BGR10 ? AJI_FMT_RGB10A2 : 0;
+            // The software backends ingest the 2-plane 4:2:0 formats only
+            // (the refqueue registers exactly NV12/P010 for the sw path).
+            if (p->is_sw && p->aji_fmt != AJI_FMT_NV12 &&
+                p->aji_fmt != AJI_FMT_P010)
+                p->aji_fmt = 0;
             if (!p->aji_fmt) {
                 MP_ERR(vf, "Unsupported sw format %s for inference\n",
-                       mp_imgfmt_to_name(p->params.hw_subfmt));
+                       mp_imgfmt_to_name(subfmt));
                 mp_filter_internal_mark_failed(vf);
                 return;
             }
@@ -1475,7 +1844,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 p->aji_fmt == AJI_FMT_RGB10A2 ? DXGI_FORMAT_R10G10B10A2_UNORM :
                 p->aji_fmt == AJI_FMT_P010    ? DXGI_FORMAT_P010 :
                                                 DXGI_FORMAT_NV12;
-            const int want = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
+            const int want = requested_depth(p);
             if (p->d3d_stage_count != want || p->d3d_stage_w != p->params.w ||
                 p->d3d_stage_h != p->params.h || p->d3d_stage_fmt != fmt) {
                 for (int i = 0; i < p->d3d_stage_count; i++)
@@ -1518,10 +1887,11 @@ static void vf_animejanai_process(struct mp_filter *vf)
         }
         p->configured = true;
 
-        mp_image_setfmt(&p->layout, p->params.hw_subfmt);
+        int layout_fmt = p->is_sw ? p->params.imgfmt : p->params.hw_subfmt;
+        mp_image_setfmt(&p->layout, layout_fmt);
         mp_image_set_size(&p->layout, p->params.w, p->params.h);
         MP_VERBOSE(vf, "Stream: %dx%d@%.3f subfmt=%s -> %dx%d\n", p->params.w,
-                   p->params.h, p->fps, mp_imgfmt_to_name(p->params.hw_subfmt),
+                   p->params.h, p->fps, mp_imgfmt_to_name(layout_fmt),
                    p->out_params.w, p->out_params.h);
     }
 
@@ -1597,33 +1967,50 @@ static void vf_animejanai_process(struct mp_filter *vf)
         bool failed = false;
         if (p->rife_prev && p->rife_prev->pts != MP_NOPTS_VALUE &&
             src->pts != MP_NOPTS_VALUE && src->pts > p->rife_prev->pts) {
+            // Build the ordered work-res grid inputs first (RIFE interpolation
+            // stays synchronous - its scene-change decision is a CPU readback),
+            // then upscale them as one batch so consecutive upscales can
+            // overlap through the ring (upscale_batch; wave 1 on the hardware
+            // paths keeps their submit+pop order). in[i] is the i-th grid
+            // point's input: an interp_source temp (owned) for a fractional
+            // offset, or cur_src (borrowed) for the integer offset.
+            struct mp_image *in[8];
+            bool owned[8];
+            double pts[8];
             while (p->rife_acc <= p->rife_num && n < 8) {
                 struct mp_image *frame;
-                double pts;
                 if (p->rife_acc == p->rife_num) {
-                    frame = upscale_image(vf, cur_src);  // source grid point
-                    pts = src->pts;
+                    frame = cur_src;  // source grid point
+                    owned[n] = false;
+                    pts[n] = src->pts;
                 } else {
                     double t = (double)p->rife_acc / p->rife_num;
-                    struct mp_image *tmp =
-                        interp_source(vf, p->rife_prev, cur_src, t);
-                    frame = tmp ? upscale_image(vf, tmp) : NULL;
-                    mp_image_unrefp(&tmp);
-                    pts = p->rife_prev->pts +
-                          (src->pts - p->rife_prev->pts) * t;
+                    frame = interp_source(vf, p->rife_prev, cur_src, t);
+                    owned[n] = true;
+                    pts[n] = p->rife_prev->pts +
+                             (src->pts - p->rife_prev->pts) * t;
                 }
                 if (!frame) {
                     failed = true;
                     break;
                 }
-                frame->pts = pts;
-                if (in_fps > 0)
-                    frame->nominal_fps = in_fps * p->rife_num / p->rife_den;
                 MP_DBG(vf, "rife-first: %s pts=%f\n",
-                       p->rife_acc == p->rife_num ? "source" : "interp", pts);
-                list[n++] = frame;
+                       p->rife_acc == p->rife_num ? "source" : "interp", pts[n]);
+                in[n++] = frame;
                 p->rife_acc += p->rife_den;
             }
+            int up = failed ? 0 : upscale_batch(vf, in, list, n, p->rife_wave);
+            for (int i = 0; i < n; i++)
+                if (owned[i])
+                    mp_image_unrefp(&in[i]);
+            if (up < n)
+                failed = true;
+            for (int i = 0; i < up; i++) {
+                list[i]->pts = pts[i];
+                if (in_fps > 0)
+                    list[i]->nominal_fps = in_fps * p->rife_num / p->rife_den;
+            }
+            n = up;
             if (failed || !n) {
                 for (int i = 0; i < n; i++)
                     mp_image_unrefp(&list[i]);
@@ -1797,6 +2184,7 @@ static void uninit(struct mp_filter *vf)
         p->api.destroy(&p->aji);
     if (p->api.handle)
         aji_lib_close(p->api.handle);
+#if HAVE_CUDA_HWACCEL
     if (p->own_stream && p->cu &&
         p->cu->cuCtxPushCurrent(p->cuda_ctx) == CUDA_SUCCESS) {
         CUcontext dummy;
@@ -1806,16 +2194,20 @@ static void uninit(struct mp_filter *vf)
         p->cu->cuStreamDestroy(p->own_stream);
         p->cu->cuCtxPopCurrent(&dummy);
     }
+#endif
 #if HAVE_D3D11
     for (int i = 0; i < p->d3d_stage_count; i++)
         ID3D11Texture2D_Release(p->d3d_stage[i]);
 #endif
     av_buffer_unref(&p->hw_pool);
+    av_buffer_unref(&p->ingest_pool);
     av_buffer_unref(&p->src_pool);
     av_buffer_unref(&p->work_pool);
     av_buffer_unref(&p->av_device_ref);
+#if HAVE_CUDA_HWACCEL
     if (p->cu)
         cuda_free_functions(&p->cu);
+#endif
 }
 
 static const struct mp_filter_info vf_animejanai_filter = {
@@ -1863,6 +2255,9 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     struct priv *p = f->priv;
     p->opts = talloc_steal(p, options);
     p->queue = mp_refqueue_alloc(f);
+    p->sw_pool = mp_image_pool_new(p);
+    p->sw_src_pool = mp_image_pool_new(p);
+    p->sw_work_pool = mp_image_pool_new(p);
     p->cur_slot = p->pending_slot = p->opts->slot;
 
     // Expand mpv path shortcuts (~~/ etc.) so portable configs can point at
@@ -1884,12 +2279,14 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
                                                        path_opts[i].src);
     }
 
-    // Not fatal: on non-NVIDIA machines the D3D11/DirectML path carries
-    // the filter; CUDA frames are rejected at reinit instead.
+#if HAVE_CUDA_HWACCEL
+    // Not fatal: on non-NVIDIA machines the D3D11/DirectML or the software
+    // path carries the filter; CUDA frames are rejected at reinit instead.
     if (cuda_load_functions(&p->cu, NULL) < 0) {
         p->cu = NULL;
-        MP_VERBOSE(f, "CUDA driver API unavailable (D3D11 input only)\n");
+        MP_VERBOSE(f, "CUDA driver API unavailable (D3D11/software input)\n");
     }
+#endif
 
     bool want_aji = p->path.engine || p->path.conf;
     if (want_aji) {
@@ -1910,6 +2307,14 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
         p->api.done = aji_lib_sym(p->api.handle, "aji_done");
         p->api.wait = aji_lib_sym(p->api.handle, "aji_wait");
         p->api.rife_factor = aji_lib_sym(p->api.handle, "aji_rife_factor");
+        // Optional (older shims lack it -> NULL -> update_depth skips the
+        // engine-ring clamp).
+        p->api.max_in_flight = aji_lib_sym(p->api.handle, "aji_max_in_flight");
+        // Optional: which backend the conf selects, without loading it (lives
+        // in the dispatcher lib). NULL on older shims / directly loaded
+        // backend libs; the software-source path then assumes TensorRT
+        // whenever a CUDA driver is loadable (the historical behaviour).
+        p->api.backend_probe = aji_lib_sym(p->api.handle, "aji_backend_probe");
         // Optional (added without an API_VERSION bump); NULL on older shims,
         // which then run the default upscale-then-RIFE order.
         p->api.rife_before_upscale =
@@ -1947,14 +2352,22 @@ static struct mp_filter *vf_animejanai_create(struct mp_filter *parent,
     // format the filter would reject and disable itself over. Backend gating:
     // yuv444p16 is TensorRT/CUDA-only; x2bgr10 (packed 10-bit RGB) is
     // DirectML/D3D11-only.
+#if HAVE_CUDA_HWACCEL
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_P010));
     mp_refqueue_add_in_format(p->queue, IMGFMT_CUDA, pixfmt2imgfmt(AV_PIX_FMT_YUV444P16));
+#endif
 #if HAVE_D3D11
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_NV12));
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_P010));
     mp_refqueue_add_in_format(p->queue, IMGFMT_D3D11, pixfmt2imgfmt(AV_PIX_FMT_X2BGR10));
 #endif
+    // Software path: the refqueue's own autoconvert delivers NV12/P010 from
+    // any software decode, so hwdec frames stay on their GPU path and
+    // everything else is upscaled from host planes (or, on a CUDA build with
+    // the TensorRT backend, uploaded at ingest - see process()).
+    mp_refqueue_add_in_format(p->queue, IMGFMT_NV12, 0);
+    mp_refqueue_add_in_format(p->queue, IMGFMT_P010, 0);
     mp_refqueue_set_refs(p->queue, 0, 0);
     mp_refqueue_set_mode(p->queue, 0);
     mp_refqueue_set_drop_check(p->queue, drop_pre_seek_target, f);
@@ -1980,13 +2393,13 @@ static const m_option_t vf_opts_fields[] = {
     {"passthrough", OPT_BOOL(passthrough)},
     {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
     {"output-444", OPT_BOOL(output_444)},
-    {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
+    {"queue-depth", OPT_INT(queue_depth), M_RANGE(0, MAX_DEPTH)},
     {0}
 };
 
 const struct mp_user_filter_entry vf_animejanai = {
     .desc = {
-        .description = "AnimeJaNai AI upscaling filter (CUDA/D3D11)",
+        .description = "AnimeJaNai AI upscaling filter (CUDA/D3D11/software)",
         .name = "animejanai",
         .priv_size = sizeof(OPT_BASE_STRUCT),
         .priv_defaults = &(const OPT_BASE_STRUCT) {
@@ -1994,7 +2407,10 @@ const struct mp_user_filter_entry vf_animejanai = {
             .slot = 1,
             .skip_seek_pre_target = true,
             .output_444 = true,
-            .queue_depth = 3,
+            // >= workers+1 keeps the multi-worker ncnn-Vulkan engine fed;
+            // update_depth clamps it to the backend's ring (TensorRT 8,
+            // ROCm 4).
+            .queue_depth = 0,   // auto: 3 hw / 6 sw (see AUTO_DEPTH_*)
         },
         .options = vf_opts_fields,
     },

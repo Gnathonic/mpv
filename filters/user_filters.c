@@ -89,6 +89,7 @@ const struct mp_user_filter_entry *vf_list[] = {
 #if HAVE_ZIMG
     &vf_fingerprint,
 #endif
+    &vf_animejanai,
 #if HAVE_VAPOURSYNTH
     &vf_vapoursynth,
 #endif
@@ -100,9 +101,6 @@ const struct mp_user_filter_entry *vf_list[] = {
 #endif
 #if HAVE_D3D_HWACCEL
     &vf_d3d11vpp,
-#endif
-#if HAVE_CUDA_HWACCEL
-    &vf_animejanai,
 #endif
 #if HAVE_AMF
     &vf_amf_frc,

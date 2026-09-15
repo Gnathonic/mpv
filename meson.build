@@ -225,6 +225,7 @@ sources = files(
     'video/filter/refqueue.c',
     'video/filter/vf_format.c',
     'video/filter/vf_sub.c',
+    'video/filter/vf_animejanai.c',
     'video/fmt-conversion.c',
     'video/hwdec.c',
     'video/image_loader.c',
@@ -1434,8 +1435,7 @@ cuda_hwaccel = get_option('cuda-hwaccel').require(
 )
 features += {'cuda-hwaccel': cuda_hwaccel.allowed()}
 if features['cuda-hwaccel']
-    sources += files('video/filter/vf_animejanai.c',
-                     'video/out/hwdec/hwdec_cuda.c')
+    sources += files('video/out/hwdec/hwdec_cuda.c')
 endif
 
 cuda_interop = get_option('cuda-interop').require(
