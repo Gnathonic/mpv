@@ -28,7 +28,8 @@
  *  - engine=file.engine: single fixed engine (spike/debug).
  *  - neither: synchronized GPU-side plane copy (passthrough).
  *
- * Upscale chains run pipelined (queue-depth frames in flight, default 3):
+ * Upscale chains run pipelined (queue-depth frames in flight; default auto =
+ * 3 on the GPU-resident paths, 6 on the software path):
  * aji_infer only submits, completion is gated per frame through the
  * shim's ticket API (aji_flush/aji_wait), and the refqueue's future-ref
  * window provides the input read-ahead. RIFE chains stay synchronous
@@ -177,6 +178,15 @@ struct opts {
 // frames than this (e.g. 5x) runs in successive waves. The hardware paths
 // keep the synchronous submit+pop per grid point (wave 1).
 #define RIFE_WAVE 4
+
+// queue-depth=0 (the default) means "auto": upstream's 3 on the GPU-resident CUDA/D3D11
+// paths, 6 on the host-plane software path, whose per-frame CPU colour + host<->GPU
+// copies need the deeper pipeline to overlap (measured on ncnn-Vulkan/ROCm). Explicit
+// values apply everywhere (still clamped to the backend ring by update_depth).
+#define AUTO_DEPTH_HW 3
+#define AUTO_DEPTH_SW 6
+struct priv;
+static int requested_depth(const struct priv *p);
 
 struct aji_api {
     void *handle;
@@ -652,10 +662,18 @@ static void write_stats(struct mp_filter *vf)
 // as do bypass and passthrough; active upscale chains run queue-depth
 // frames deep, with the refqueue's future-ref window supplying the
 // read-ahead (depth - 1 buffered future frames).
+static int requested_depth(const struct priv *p)
+{
+    int d = p->opts->queue_depth;
+    if (d <= 0)
+        d = p->is_sw ? AUTO_DEPTH_SW : AUTO_DEPTH_HW;
+    return MPCLAMP(d, 1, MAX_DEPTH);
+}
+
 static void update_depth(struct mp_filter *vf)
 {
     struct priv *p = vf->priv;
-    int depth = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
+    int depth = requested_depth(p);
     int wave = p->is_sw ? RIFE_WAVE : 1;
     // The backend's engine ring is a HARD cap on in-flight frames: the
     // pipelined submit loop fills the ring before it collects any, so a
@@ -1814,7 +1832,7 @@ static void vf_animejanai_process(struct mp_filter *vf)
                 p->aji_fmt == AJI_FMT_RGB10A2 ? DXGI_FORMAT_R10G10B10A2_UNORM :
                 p->aji_fmt == AJI_FMT_P010    ? DXGI_FORMAT_P010 :
                                                 DXGI_FORMAT_NV12;
-            const int want = MPCLAMP(p->opts->queue_depth, 1, MAX_DEPTH);
+            const int want = requested_depth(p);
             if (p->d3d_stage_count != want || p->d3d_stage_w != p->params.w ||
                 p->d3d_stage_h != p->params.h || p->d3d_stage_fmt != fmt) {
                 for (int i = 0; i < p->d3d_stage_count; i++)
@@ -2363,7 +2381,7 @@ static const m_option_t vf_opts_fields[] = {
     {"passthrough", OPT_BOOL(passthrough)},
     {"skip-seek-pre-target", OPT_BOOL(skip_seek_pre_target)},
     {"output-444", OPT_BOOL(output_444)},
-    {"queue-depth", OPT_INT(queue_depth), M_RANGE(1, MAX_DEPTH)},
+    {"queue-depth", OPT_INT(queue_depth), M_RANGE(0, MAX_DEPTH)},
     {0}
 };
 
@@ -2380,7 +2398,7 @@ const struct mp_user_filter_entry vf_animejanai = {
             // >= workers+1 keeps the multi-worker ncnn-Vulkan engine fed;
             // update_depth clamps it to the backend's ring (TensorRT 8,
             // ROCm 4).
-            .queue_depth = 6,
+            .queue_depth = 0,   // auto: 3 hw / 6 sw (see AUTO_DEPTH_*)
         },
         .options = vf_opts_fields,
     },
